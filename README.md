@@ -74,6 +74,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/authorizations` | 为素材登记一条授权 |
 | `GET` | `/authorizations/{id}` | 查询授权（含已用/剩余次数） |
 | `PATCH` | `/authorizations/{id}` | 启用/停用授权（仅影响新申请） |
+| `POST` | `/authorizations/migrate` | **授权退役：原授权未撤销申请一次性改挂到替代授权** |
 | `POST` | `/distributions` | **提交发行申请：整体核验并原子占用** |
 | `GET` | `/distributions/{id}` | 查询发行申请（含各项命中授权） |
 | `POST` | `/distributions/{id}/revoke` | **撤销申请（仅可一次），释放占用次数** |
@@ -93,6 +94,27 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    已通过申请仍可查询、可撤销。
 7. **撤销**：已通过申请仅可成功撤销一次；撤销后逐项释放占用次数，
    申请记录保留且状态变为 `revoked`，仍可查询。重复撤销返回 `409`。
+
+### 授权退役改挂规则
+
+授权需要退役时，运营用**原授权编号 + 替代授权编号**，把原授权承载的
+**全部未撤销（`approved`）发行申请一次性改挂**到替代授权：
+
+1. 两端授权编号必须**不同**，且**素材、地区、渠道完全一致**。
+2. 替代授权必须处于 **`active` 启用**状态；其时段（左闭右开）必须
+   **覆盖每条待迁移申请的发行时刻**；且**剩余次数足够一次性承接
+   全部迁入占用**。
+3. **任一条件不满足则整体拒绝**：不改动任何申请归属，原/替代两端
+   次数与状态均不变（原授权不会被停用）。
+4. **成功后**：原授权置为 `inactive`（停用），其占用次数按迁移条数
+   迁出（归零的部分即迁移条数）；替代授权按迁移条数增加占用；
+   返回 `migrated_count` 与两端授权（含各自剩余次数）。
+5. **已撤销申请不迁移**：`revoked` 申请的明细仍归属原授权、状态不变。
+   原授权若已无未撤销申请，迁移数为 `0`，原授权仍会被停用（幂等，
+   可重复调用）。
+6. 改挂后的申请在查询接口中显示为**替代授权**；仍可通过原
+   `POST /distributions/{id}/revoke` 接口撤销，**撤销只释放替代授权
+   一次**，原授权次数不受影响。
 
 ### 错误响应格式
 
@@ -122,14 +144,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 422 | `unknown_material` | 登记授权/发行申请引用了未知素材编号 |
 | 422 | `duplicate_material_items` | 同一发行申请中携带重复素材 |
 | 422 | `distribution_rejected` | 核验未通过；`details` 按项列明原因（见下） |
+| 422 | `migration_rejected` | 授权改挂核验未通过；`details` 列明原因（见下），归属与次数均不变 |
 | 409 | `already_revoked` | 对已撤销申请重复撤销 |
-| 404 | `not_found` | 路径中的素材/授权/申请编号不存在 |
+| 404 | `not_found` | 路径中的素材/授权/申请编号不存在（改挂时原/替代授权任一不存在） |
 
 `distribution_rejected` 的逐项原因 `reason`：
 
 - `no_matching_authorization`：没有同时匹配地区、渠道与发行时刻的授权
 - `authorization_inactive`：匹配的授权均已停用
 - `quota_exhausted`：匹配授权的可发行次数已用尽
+
+`migration_rejected` 的原因 `reason`（`details` 中附带两端授权编号）：
+
+- `same_authorization`：原授权与替代授权编号相同
+- `dimension_mismatch`：两端素材、地区或渠道不一致
+- `replacement_inactive`：替代授权未启用
+- `period_not_covered`：替代授权时段未覆盖某些申请的发行时刻
+- `insufficient_quota`：替代授权余量不足以一次性承接全部迁入占用
 
 ---
 
@@ -191,6 +222,18 @@ curl -s -X PATCH http://localhost:8000/api/v1/authorizations/1 \
   -H 'Content-Type: application/json' -d '{"status": "inactive"}'
 curl -s -X PATCH http://localhost:8000/api/v1/authorizations/1 \
   -H 'Content-Type: application/json' -d '{"status": "active"}'
+
+# 7) 授权退役改挂：把授权 1 承载的全部未撤销申请一次性改挂到授权 3
+curl -s -X POST http://localhost:8000/api/v1/authorizations/migrate \
+  -H 'Content-Type: application/json' \
+  -d '{"source_authorization_id": 1, "replacement_authorization_id": 3}'
+# 200：{"migrated_count": 2,
+#       "source_authorization":      {... "used_count": 0, "remaining": 3, "status": "inactive"},
+#       "replacement_authorization": {... "used_count": 2, "remaining": 8, "status": "active"}}
+
+# 改挂后查询申请显示替代授权；仍可用原接口撤销，撤销只释放替代授权一次
+curl -s http://localhost:8000/api/v1/distributions/1
+curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
 ```
 
 成功的发行申请响应示例：
@@ -225,19 +268,33 @@ curl -s -X PATCH http://localhost:8000/api/v1/authorizations/1 \
 
 ## 5. 并发控制设计
 
-发行核验在单个数据库事务内完成，通过三层机制保证不超额：
+所有写事务在单个数据库事务内完成，并遵守统一的全局加锁顺序，
+**从根上杜绝跨事务死锁**：
 
-1. **候选授权行锁 `SELECT ... FOR UPDATE`**：先按授权 `id` 全局升序加锁
-   （与撤销事务相同的第一加锁点与加锁顺序，杜绝跨事务死锁），涉及相同授权的并发申请被数据库串行化。
-2. **通道咨询锁 `pg_advisory_xact_lock`**：再加按 `region+channel` 分桶的咨询锁，
-   使同一通道内、触及不同授权集合的申请也串行判定，消除
-   「各自读到有余量、先后扣减导致超额」的竞态；事务提交/回滚时自动释放。
-3. **条件更新扣次**：`UPDATE ... SET used_count = used_count + n
-   WHERE used_count <= max_count - n` 并断言影响行数，作为超额的最后防线。
+```
+通道咨询锁 pg_advisory_xact_lock(region+channel)
+        → 申请行锁（distributions，id 升序）
+        → 授权行锁（authorizations，id 升序）
+        → 明细行锁（distribution_items，id 升序）
+```
 
-核验不通过即 `ROLLBACK`，不产生任何次数占用；撤销时先锁定申请行复查状态
-（并发双重撤销恰为一次 `200`、一次 `409`），再锁授权行释放，
-保证 `used_count` 恒等于处于 `approved` 状态的占用明细数。
+1. **通道咨询锁 `pg_advisory_xact_lock`**：按 `region+channel` 分桶，
+   同一通道内的提交、撤销、改挂由此串行判定，消除「各自读到有余量、
+   先后扣减导致超额」以及「改挂与撤销各读到一半旧状态」的竞态；
+   事务提交/回滚时自动释放（同事务内重入同把锁安全）。
+2. **行锁 `SELECT ... FOR UPDATE`**：申请行锁串行化对同一申请的并发
+   撤销（恰为一次 `200`、一次 `409`）；授权行始终按 `id` 全局升序
+   加锁；改挂与撤销还会锁定相关**明细行**，固定「明细 → 授权」的
+   当前归属——并发下撤销要么在改挂前提交（释放原授权），要么等待改挂
+   提交后释放替代授权，绝不会重复释放或释放错授权。
+3. **条件更新**：提交扣次 `WHERE used_count < max_count`、改挂迁入
+   `WHERE used_count <= max_count - n` / 迁出 `WHERE used_count >= n`、
+   撤销释放 `WHERE used_count >= 1`，并断言影响行数，作为超额/重复
+   释放的最后防线。
+
+核验/改挂不通过即 `ROLLBACK`，不产生任何次数或归属变化。任意时刻
+都有不变量：`used_count` 恒等于归属该授权且处于 `approved` 状态的
+占用明细数，且 `0 <= used_count <= max_count`。
 
 ---
 
@@ -248,14 +305,20 @@ curl -s -X PATCH http://localhost:8000/api/v1/authorizations/1 \
 - `tests/test_api.py`：43 项端到端用例，覆盖左闭右开边界、地区/渠道匹配、
   次数耗尽、撤销释放、停用语义、整体拒绝原子性、重复素材、未知编号、
   重复撤销、重叠授权选择顺序等。
+- `tests/test_migrate.py`：63 项授权退役改挂用例，覆盖正常改挂与次数搬移、
+  查询显示替代授权、改挂后撤销只释放替代授权一次、已撤销不迁移、幂等空迁移、
+  多素材批量、两端相同/维度不一致/替代停用/时段不覆盖（含左闭右开边界）/
+  余量不足五类拒绝的原子性、404/422 等。
 - `tests/test_concurrency.py`：并发安全用例（20/30 并发抢占、多素材批量、
-  撤销与新申请交错、并发双重撤销），断言绝不超额且账实相符。
+  撤销与新申请交错、并发双重撤销、**改挂与撤销并发、改挂与提交并发、
+  并发重复改挂**），断言绝不超额、不重复释放且账实相符。
 
 ```bash
 pip install -r requirements.txt httpx
 # 指向任意可用 PostgreSQL 16
 export DATABASE_URL="postgresql+psycopg://licensing@localhost:5432/licensing"
 python3 -m tests.test_api
+python3 -m tests.test_migrate
 python3 -m tests.test_concurrency
 ```
 
@@ -280,5 +343,6 @@ python3 -m tests.test_concurrency
 │   └── services.py    # 核验、原子占用、撤销（核心事务逻辑）
 └── tests/
     ├── test_api.py
+    ├── test_migrate.py
     └── test_concurrency.py
 ```

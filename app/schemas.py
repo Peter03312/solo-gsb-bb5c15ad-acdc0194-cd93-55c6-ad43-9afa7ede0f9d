@@ -138,6 +138,30 @@ class DistributionItemOut(BaseModel):
     authorization: AuthorizationOut
 
 
+# ------------------------------------------------------- 授权退役改挂
+class AuthorizationMigrationRequest(BaseModel):
+    """原授权退役：将其承载的全部未撤销申请一次性改挂到替代授权。"""
+
+    source_authorization_id: int = Field(
+        gt=0, description="原授权编号（退役方）"
+    )
+    replacement_authorization_id: int = Field(
+        gt=0, description="替代授权编号（承接方，须与原授权不同）"
+    )
+
+
+class AuthorizationMigrationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    migrated_count: int = Field(description="实际改挂的未撤销申请明细条数")
+    source_authorization: AuthorizationOut = Field(
+        description="原授权（成功后已停用，次数已迁出）"
+    )
+    replacement_authorization: AuthorizationOut = Field(
+        description="替代授权（已承接全部迁入占用）"
+    )
+
+
 class DistributionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

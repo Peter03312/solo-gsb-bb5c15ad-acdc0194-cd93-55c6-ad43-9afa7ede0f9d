@@ -19,10 +19,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
-        "对发行申请做整体核验、原子占用，支持查询与一次性撤销。"
+        "对发行申请做整体核验、原子占用，支持查询、一次性撤销，"
+        "以及授权退役时将未撤销申请一次性改挂到替代授权。"
     ),
     lifespan=lifespan,
 )
@@ -104,6 +105,19 @@ def update_authorization(
     return services.set_authorization_status(
         db, authorization_id, body.status
     )
+
+
+@app.post(
+    "/api/v1/authorizations/migrate",
+    response_model=schemas.AuthorizationMigrationOut,
+    tags=["authorizations"],
+    summary="授权退役改挂：原授权承载的全部未撤销申请一次性改挂到替代授权",
+)
+def migrate_authorization(
+    body: schemas.AuthorizationMigrationRequest,
+    db: Session = Depends(get_db),
+):
+    return services.migrate_authorization(db, body)
 
 
 # ------------------------------------------------------------------ 发行

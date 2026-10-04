@@ -77,3 +77,15 @@ class AlreadyRevoked(APIError):
             code="already_revoked",
             message=f"发行申请已撤销，不可重复撤销：{distribution_id}",
         )
+
+
+class MigrationRejected(APIError):
+    """授权退役改挂核验未通过：整体拒绝，归属与次数均不变。"""
+
+    def __init__(self, reasons: list[dict]):
+        super().__init__(
+            status_code=422,
+            code="migration_rejected",
+            message="授权改挂核验未通过，未变更任何申请归属与次数",
+            details=reasons,
+        )
