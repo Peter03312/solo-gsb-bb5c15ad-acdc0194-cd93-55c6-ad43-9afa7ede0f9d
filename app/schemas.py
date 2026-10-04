@@ -85,6 +85,25 @@ class AuthorizationUpdate(BaseModel):
     )
 
 
+class AuthorizationMigrate(BaseModel):
+    """授权退役迁移请求：将原授权承载的全部未撤销申请改挂到替代授权。"""
+
+    target_authorization_id: int = Field(
+        gt=0, description="替代授权编号（须与原授权不同）"
+    )
+
+
+class MigrationOut(BaseModel):
+    """迁移结果：迁移数与两端剩余次数。"""
+
+    source_authorization_id: int
+    target_authorization_id: int
+    migrated_count: int = Field(description="本次改挂的未撤销申请数")
+    source_status: str = Field(description="迁移成功后原授权状态（inactive）")
+    source_remaining: int = Field(description="迁移后原授权剩余次数")
+    target_remaining: int = Field(description="迁移后替代授权剩余次数")
+
+
 class AuthorizationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

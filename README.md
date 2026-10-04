@@ -1,6 +1,6 @@
 # 素材发行授权核验 HTTP API
 
-为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，并支持已通过申请的查询与**一次性撤销（释放占用）**。
+为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，并支持已通过申请的查询与**一次性撤销（释放占用）**；授权需要退役时，可将原授权承载的全部未撤销申请**一次性改挂到替代授权**。
 
 - 技术栈：Python 3.11 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Pydantic v2
 - 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额**
@@ -74,6 +74,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/authorizations` | 为素材登记一条授权 |
 | `GET` | `/authorizations/{id}` | 查询授权（含已用/剩余次数） |
 | `PATCH` | `/authorizations/{id}` | 启用/停用授权（仅影响新申请） |
+| `POST` | `/authorizations/{id}/migrate` | **退役迁移：将原授权承载的全部未撤销申请改挂到替代授权** |
 | `POST` | `/distributions` | **提交发行申请：整体核验并原子占用** |
 | `GET` | `/distributions/{id}` | 查询发行申请（含各项命中授权） |
 | `POST` | `/distributions/{id}/revoke` | **撤销申请（仅可一次），释放占用次数** |
@@ -93,6 +94,29 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    已通过申请仍可查询、可撤销。
 7. **撤销**：已通过申请仅可成功撤销一次；撤销后逐项释放占用次数，
    申请记录保留且状态变为 `revoked`，仍可查询。重复撤销返回 `409`。
+
+### 授权退役迁移规则
+
+`POST /api/v1/authorizations/{id}/migrate`，请求体
+`{"target_authorization_id": <替代授权编号>}`，将原授权承载的
+**全部未撤销发行申请**一次性改挂到替代授权：
+
+1. 前置条件（**任一不满足则整体拒绝**，申请归属与两端次数均不变）：
+   - 原授权与替代授权编号必须不同；
+   - 两者的**素材、地区、渠道**必须一致；
+   - 替代授权必须处于**启用**状态；
+   - 替代授权时段必须**覆盖每条待迁移申请的发行时刻**（左闭右开）；
+   - 替代授权剩余次数必须**足以承接全部待迁移占用**。
+2. 成功后：全部未撤销申请的占用明细改挂替代授权（替代授权 `used_count`
+   增加、原授权等额减少），**原授权停用（退役）**；返回迁移数与两端剩余次数。
+3. **已撤销申请不迁移**：其明细仍指向原授权（历史快照），不占任何次数。
+4. 改挂后的申请查询显示替代授权；仍可按原接口撤销，**撤销只释放
+   替代授权一次**。
+5. 原授权上没有未撤销申请时迁移依然成功（迁移数为 0），可用于
+   幂等地完成退役；同一源授权的并发迁移串行执行，全部申请恰被改挂一次。
+6. 与迁移并发新通过的申请可能仍落在已停用的原授权上（与既有
+   「停用与并发申请」语义一致）：不迁移、计数正确、可正常查询与撤销，
+   必要时可再次调用迁移将其改挂。
 
 ### 错误响应格式
 
@@ -122,6 +146,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 422 | `unknown_material` | 登记授权/发行申请引用了未知素材编号 |
 | 422 | `duplicate_material_items` | 同一发行申请中携带重复素材 |
 | 422 | `distribution_rejected` | 核验未通过；`details` 按项列明原因（见下） |
+| 422 | `migration_rejected` | 退役迁移前置条件不满足；`details` 列明全部原因（见下） |
 | 409 | `already_revoked` | 对已撤销申请重复撤销 |
 | 404 | `not_found` | 路径中的素材/授权/申请编号不存在 |
 
@@ -130,6 +155,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `no_matching_authorization`：没有同时匹配地区、渠道与发行时刻的授权
 - `authorization_inactive`：匹配的授权均已停用
 - `quota_exhausted`：匹配授权的可发行次数已用尽
+
+`migration_rejected` 的逐项原因 `reason`：
+
+- `same_authorization`：原授权与替代授权编号相同
+- `dimension_mismatch`：素材、地区、渠道不一致
+- `target_inactive`：替代授权未启用
+- `period_not_covered`：替代授权时段未覆盖某条申请的发行时刻
+  （`details` 中给出 `distribution_id`）
+- `insufficient_quota`：替代授权剩余次数不足以承接全部待迁移占用
 
 ---
 
@@ -193,6 +227,53 @@ curl -s -X PATCH http://localhost:8000/api/v1/authorizations/1 \
   -H 'Content-Type: application/json' -d '{"status": "active"}'
 ```
 
+### 授权退役迁移（本轮新增）
+
+```bash
+# 7) 登记替代授权：同素材/地区/渠道，时段覆盖待迁移申请、余量充足
+curl -s -X POST http://localhost:8000/api/v1/authorizations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "material_id": 1,
+    "region": "CN",
+    "channel": "web",
+    "starts_at": "2026-09-01T00:00:00+08:00",
+    "ends_at":   "2026-12-01T00:00:00+08:00",
+    "max_count": 10
+  }'
+# 假设返回 id=3
+
+# 8) 退役迁移：将授权 1 承载的全部未撤销申请改挂到授权 3
+curl -s -X POST http://localhost:8000/api/v1/authorizations/1/migrate \
+  -H 'Content-Type: application/json' \
+  -d '{"target_authorization_id": 3}'
+```
+
+成功响应示例（迁移数 + 两端剩余次数）：
+
+```json
+{
+  "source_authorization_id": 1,
+  "target_authorization_id": 3,
+  "migrated_count": 2,
+  "source_status": "inactive",
+  "source_remaining": 3,
+  "target_remaining": 8
+}
+```
+
+```bash
+# 9) 改挂后的申请查询显示替代授权，仍可按原接口撤销（只释放替代授权）
+curl -s http://localhost:8000/api/v1/distributions/2
+curl -s -X POST http://localhost:8000/api/v1/distributions/2/revoke
+
+# 10) 前置条件不满足 -> 422 migration_rejected，申请归属与两端次数均不变
+curl -s -X POST http://localhost:8000/api/v1/authorizations/1/migrate \
+  -H 'Content-Type: application/json' \
+  -d '{"target_authorization_id": 1}'
+# {"error":{"code":"migration_rejected","message":"...","details":[{"reason":"same_authorization",...}]}}
+```
+
 成功的发行申请响应示例：
 
 ```json
@@ -239,17 +320,27 @@ curl -s -X PATCH http://localhost:8000/api/v1/authorizations/1 \
 （并发双重撤销恰为一次 `200`、一次 `409`），再锁授权行释放，
 保证 `used_count` 恒等于处于 `approved` 状态的占用明细数。
 
+退役迁移在同一事务内按全局一致的加锁层级执行：
+**占用明细行锁 → 申请行锁（id 升序）→ 两端授权行锁（id 升序）→
+通道咨询锁**，与撤销/核验事务的加锁点两两兼容、无死锁；定位待迁移集合
+只使用普通列条件（行锁等待后由数据库重新评估，并发迁移的改挂、
+并发撤销的状态变更在锁定后立即可见），全部前置校验在持锁后基于最新
+数据判定，两端次数用条件更新兜底。因此迁移与提交、撤销并发时
+**不超额、不重复释放**，同一源授权的并发迁移恰改挂一次。
+
 ---
 
 ## 6. 测试
 
 测试套件基于真实 PostgreSQL（非模拟），通过 FastAPI TestClient 发起 HTTP 请求：
 
-- `tests/test_api.py`：43 项端到端用例，覆盖左闭右开边界、地区/渠道匹配、
+- `tests/test_api.py`：73 项端到端用例，覆盖左闭右开边界、地区/渠道匹配、
   次数耗尽、撤销释放、停用语义、整体拒绝原子性、重复素材、未知编号、
-  重复撤销、重叠授权选择顺序等。
+  重复撤销、重叠授权选择顺序，以及退役迁移的前置校验、改挂、
+  原授权停用、已撤销申请不迁移、迁移后撤销只释放替代授权等。
 - `tests/test_concurrency.py`：并发安全用例（20/30 并发抢占、多素材批量、
-  撤销与新申请交错、并发双重撤销），断言绝不超额且账实相符。
+  撤销与新申请交错、并发双重撤销、迁移与新申请抢占替代授权、
+  迁移与撤销交错、同一源授权并发双重迁移），断言绝不超额且账实相符。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -277,7 +368,7 @@ python3 -m tests.test_concurrency
 │   ├── models.py      # Material / Authorization / Distribution(+Item)
 │   ├── schemas.py     # 请求响应模型与时段/时区校验
 │   ├── errors.py      # 业务错误码
-│   └── services.py    # 核验、原子占用、撤销（核心事务逻辑）
+│   └── services.py    # 核验、原子占用、撤销、退役迁移（核心事务逻辑）
 └── tests/
     ├── test_api.py
     └── test_concurrency.py

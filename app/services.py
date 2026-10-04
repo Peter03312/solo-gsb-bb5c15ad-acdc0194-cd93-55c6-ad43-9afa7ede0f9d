@@ -29,6 +29,7 @@ from app.errors import (
     DistributionRejected,
     DuplicateMaterialItems,
     MaterialCodeTaken,
+    MigrationRejected,
     ResourceNotFound,
     UnknownMaterial,
 )
@@ -94,6 +95,247 @@ def set_authorization_status(
     db.commit()
     db.refresh(auth)
     return auth
+
+
+# ------------------------------------------------------- 授权退役迁移
+def migrate_authorization(
+    db: Session, source_id: int, target_id: int
+) -> dict:
+    """将原授权承载的全部未撤销发行申请一次性改挂到替代授权。
+
+    前置条件（任一不满足则整体拒绝，申请归属与两端次数均不变）：
+    两者不同；素材/地区/渠道一致；替代授权启用；替代授权时段覆盖
+    每条待迁移申请的发行时刻；替代授权余量足以承接全部占用。
+    成功后原授权停用（退役），返回迁移数与两端剩余次数。
+
+    并发安全：加锁顺序与核验/撤销事务构成同一全局层级——
+    「明细行锁 → 申请行锁（id 升序）→ 授权行锁（id 升序）→
+    通道咨询锁」，与撤销事务相同的申请加锁点、与核验事务相同的
+    授权锁顺序与咨询锁，杜绝跨事务死锁。定位待迁移集合只使用
+    普通列条件：READ COMMITTED 下行锁等待后会重新评估普通列
+    条件（IN 子查询不会被重新评估），并发迁移/撤销提交后，已改挂
+    明细与已撤销申请自动从集合中剔除。全部判定在持锁后基于最新
+    数据执行，两端次数用条件更新兜底，绝不超额、绝不重复释放。
+    """
+    # 1) 两者必须不同（无需加锁即可判定）。
+    if source_id == target_id:
+        raise MigrationRejected(
+            [
+                {
+                    "reason": "same_authorization",
+                    "message": f"原授权与替代授权相同：{source_id}",
+                }
+            ]
+        )
+
+    # 2) 存在性检查（无删除操作，普通标量读即可；不加载 ORM 对象，
+    #    避免后续行锁等待期间读到会话内的过期属性）。
+    existing = set(
+        db.scalars(
+            select(models.Authorization.id).where(
+                models.Authorization.id.in_([source_id, target_id])
+            )
+        )
+    )
+    if source_id not in existing:
+        raise ResourceNotFound("授权", source_id)
+    if target_id not in existing:
+        raise ResourceNotFound("授权", target_id)
+
+    try:
+        # 3) 第一加锁点：源授权当前承载的全部占用明细行，按 id 升序
+        #    FOR UPDATE。普通列条件在锁等待后重新评估：并发迁移已
+        #    改挂的明细自动剔除；并发迁移由此串行（同一源授权的
+        #    两次迁移逐个进行）。
+        items = list(
+            db.scalars(
+                select(models.DistributionItem)
+                .where(models.DistributionItem.authorization_id == source_id)
+                .order_by(models.DistributionItem.id.asc())
+                .with_for_update()
+            )
+        )
+
+        # 4) 第二加锁点：上述明细所属的、仍未撤销的申请行，按 id
+        #    升序 FOR UPDATE（与撤销事务相同的申请加锁点与全局
+        #    顺序）。status 为普通列条件，锁等待后重新评估：并发
+        #    撤销的申请自动剔除，已撤销申请不迁移。
+        dist_ids = sorted({item.distribution_id for item in items})
+        distributions: list[models.Distribution] = []
+        if dist_ids:
+            distributions = list(
+                db.scalars(
+                    select(models.Distribution)
+                    .where(
+                        models.Distribution.id.in_(dist_ids),
+                        models.Distribution.status == "approved",
+                    )
+                    .order_by(models.Distribution.id.asc())
+                    .with_for_update()
+                )
+            )
+
+        # 5) 第三加锁点：两端授权行按 id 升序 FOR UPDATE（与核验/
+        #    撤销事务同一全局加锁顺序，杜绝死锁）。行锁等待期间
+        #    其他事务的扣次/释放均已提交，此处读到的是最新数据。
+        locked = {
+            row.id: row
+            for row in db.scalars(
+                select(models.Authorization)
+                .where(models.Authorization.id.in_([source_id, target_id]))
+                .order_by(models.Authorization.id.asc())
+                .with_for_update()
+            )
+        }
+        source, target = locked[source_id], locked[target_id]
+
+        # 6) 第四加锁点：通道咨询锁（与核验事务相同分桶），使迁移
+        #    与同 region+channel 的新申请串行判定；回滚/提交自动释放。
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lk)"),
+            {"lk": _bucket_lock_id(source.region, source.channel)},
+        )
+
+        # 7) 持锁后逐项校验，收集全部失败原因，任一不满足整体回滚。
+        reasons: list[dict] = []
+        if (
+            source.material_id != target.material_id
+            or source.region != target.region
+            or source.channel != target.channel
+        ):
+            reasons.append(
+                {
+                    "reason": "dimension_mismatch",
+                    "message": (
+                        "素材、地区、渠道须一致："
+                        f"原授权（material_id={source.material_id}, "
+                        f"region={source.region}, channel={source.channel}），"
+                        f"替代授权（material_id={target.material_id}, "
+                        f"region={target.region}, channel={target.channel}）"
+                    ),
+                }
+            )
+        if target.status != "active":
+            reasons.append(
+                {
+                    "reason": "target_inactive",
+                    "message": f"替代授权未启用：id={target.id}",
+                }
+            )
+        for dist in distributions:
+            if not (target.starts_at <= dist.occur_at < target.ends_at):
+                reasons.append(
+                    {
+                        "distribution_id": dist.id,
+                        "reason": "period_not_covered",
+                        "message": (
+                            f"替代授权时段未覆盖申请 {dist.id} 的发行时刻 "
+                            f"{dist.occur_at.isoformat()}"
+                        ),
+                    }
+                )
+        migrated_count = len(distributions)
+        if target.remaining < migrated_count:
+            reasons.append(
+                {
+                    "reason": "insufficient_quota",
+                    "message": (
+                        f"替代授权余量不足：需承接 {migrated_count} 次占用，"
+                        f"剩余 {target.remaining} 次"
+                    ),
+                }
+            )
+        if reasons:
+            # 显式回滚，释放锁；申请归属与两端次数均不变。
+            db.rollback()
+            raise MigrationRejected(reasons)
+
+        # 8) 条件更新两端次数（防止超额/重复释放的最后防线），
+        #    维持不变量：used_count == 该授权上 approved 明细数。
+        if migrated_count:
+            result = db.execute(
+                update(models.Authorization)
+                .where(
+                    models.Authorization.id == target_id,
+                    models.Authorization.used_count
+                    <= models.Authorization.max_count - migrated_count,
+                )
+                .values(
+                    used_count=models.Authorization.used_count
+                    + migrated_count
+                )
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                raise MigrationRejected(
+                    [
+                        {
+                            "reason": "insufficient_quota",
+                            "message": (
+                                f"替代授权 id={target_id} 余量不足，"
+                                "并发占用冲突，本次迁移整体拒绝"
+                            ),
+                        }
+                    ]
+                )
+            result = db.execute(
+                update(models.Authorization)
+                .where(
+                    models.Authorization.id == source_id,
+                    models.Authorization.used_count >= migrated_count,
+                )
+                .values(
+                    used_count=models.Authorization.used_count
+                    - migrated_count
+                )
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                raise MigrationRejected(
+                    [
+                        {
+                            "reason": "quota_conflict",
+                            "message": (
+                                f"原授权 id={source_id} 占用数并发变化，"
+                                "本次迁移整体拒绝"
+                            ),
+                        }
+                    ]
+                )
+
+            # 9) 改挂：仅未撤销申请中指向原授权的明细改挂替代授权；
+            #    已撤销申请的明细保持原样（历史快照，不占次数）。
+            db.execute(
+                update(models.DistributionItem)
+                .where(
+                    models.DistributionItem.authorization_id == source_id,
+                    models.DistributionItem.distribution_id.in_(
+                        [dist.id for dist in distributions]
+                    ),
+                )
+                .values(authorization_id=target_id)
+            )
+
+        # 10) 原授权停用（退役），此后不再参与新申请匹配。
+        source.status = "inactive"
+        db.commit()
+    except MigrationRejected:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    # 11) 提交后重新读取两端最新状态，返回迁移数与两端剩余次数。
+    db.refresh(source)
+    db.refresh(target)
+    return {
+        "source_authorization_id": source_id,
+        "target_authorization_id": target_id,
+        "migrated_count": migrated_count,
+        "source_status": source.status,
+        "source_remaining": source.remaining,
+        "target_remaining": target.remaining,
+    }
 
 
 # ------------------------------------------------------- 发行核验与占用

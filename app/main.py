@@ -106,6 +106,22 @@ def update_authorization(
     )
 
 
+@app.post(
+    "/api/v1/authorizations/{authorization_id}/migrate",
+    response_model=schemas.MigrationOut,
+    tags=["authorizations"],
+    summary="退役迁移：将原授权承载的全部未撤销申请改挂到替代授权",
+)
+def migrate_authorization(
+    authorization_id: int,
+    body: schemas.AuthorizationMigrate,
+    db: Session = Depends(get_db),
+):
+    return services.migrate_authorization(
+        db, authorization_id, body.target_authorization_id
+    )
+
+
 # ------------------------------------------------------------------ 发行
 @app.post(
     "/api/v1/distributions",

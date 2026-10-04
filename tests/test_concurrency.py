@@ -16,7 +16,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 os.environ.setdefault(
     "DATABASE_URL",
@@ -200,8 +200,6 @@ def scenario_revoke_race() -> None:
     assert 0 <= new_ok <= 10
 
     # 以数据库直接统计 approved 明细数为准，校验账实相符。
-    from sqlalchemy import func
-
     db = SessionLocal()
     try:
         used = db.get(models.Authorization, aid).used_count
@@ -270,6 +268,295 @@ def scenario_repeat_revoke_race() -> None:
     print(f"  PASS  并发双撤销返回 {sorted(codes)}，状态=revoked，次数只释放一次")
 
 
+def scenario_migrate_vs_apply() -> None:
+    print("== 场景5：迁移与并发新申请抢占替代授权额度，不得超额 ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c5", "name": "迁移并发素材"}
+    ).json()["id"]
+    # 先建源授权并提交 5 条申请（此时唯一候选，全部落在 src）。
+    src = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "BR",
+            "channel": "web",
+            "starts_at": (NOW - timedelta(days=1)).isoformat(),
+            "ends_at": (NOW + timedelta(days=2)).isoformat(),
+            "max_count": 10,
+        },
+    ).json()["id"]
+    for _ in range(5):
+        r = client.post(
+            "/api/v1/distributions",
+            json={
+                "material_ids": [mid],
+                "region": "BR",
+                "channel": "web",
+                "occur_at": NOW.isoformat(),
+            },
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["items"][0]["authorization"]["id"] == src
+    # 再建替代授权：到期更早，之后的新申请优先命中它（溢出才落到 src）。
+    tgt = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "BR",
+            "channel": "web",
+            "starts_at": (NOW - timedelta(days=2)).isoformat(),
+            "ends_at": (NOW + timedelta(days=1)).isoformat(),
+            "max_count": 8,
+        },
+    ).json()["id"]
+
+    def migrate():
+        c = TestClient(app)
+        r = c.post(
+            f"/api/v1/authorizations/{src}/migrate",
+            json={"target_authorization_id": tgt},
+        )
+        return r.status_code, r.json()
+
+    def apply(i: int):
+        c = TestClient(app)
+        r = c.post(
+            "/api/v1/distributions",
+            json={
+                "material_ids": [mid],
+                "region": "BR",
+                "channel": "web",
+                "occur_at": NOW.isoformat(),
+            },
+        )
+        return r.status_code
+
+    with ThreadPoolExecutor(max_workers=11) as pool:
+        mig_future = pool.submit(migrate)
+        app_futures = [pool.submit(apply, i) for i in range(10)]
+        mig_code, mig_body = mig_future.result()
+        app_codes = [f.result() for f in app_futures]
+
+    new_ok = app_codes.count(201)
+    src_now = client.get(f"/api/v1/authorizations/{src}").json()
+    tgt_now = client.get(f"/api/v1/authorizations/{tgt}").json()
+
+    if mig_code == 200:
+        # 迁移成功：承接 5 条，tgt 仅剩 3 个名额，源授权停用。
+        assert mig_body["migrated_count"] == 5, mig_body
+        assert new_ok == 3, f"迁移成功后新申请应成功 3 个，实际 {new_ok}"
+        assert src_now["status"] == "inactive" and src_now["used_count"] == 0
+        assert tgt_now["used_count"] == 8, tgt_now
+    else:
+        # 迁移被拒绝：只能是余量不足；新申请占满 tgt 后溢出 src。
+        assert mig_code == 422, mig_body
+        assert mig_body["error"]["code"] == "migration_rejected", mig_body
+        assert (
+            mig_body["error"]["details"][0]["reason"] == "insufficient_quota"
+        ), mig_body
+        assert new_ok == 10, f"迁移失败后新申请应全部成功，实际 {new_ok}"
+        assert tgt_now["used_count"] == 8, tgt_now
+        assert src_now["used_count"] == 7, src_now
+
+    # 账实相符：两端 used_count 恒等于各自 approved 明细数，且不超额。
+    db = SessionLocal()
+    try:
+        for aid, used in ((src, src_now["used_count"]),
+                          (tgt, tgt_now["used_count"])):
+            approved_items = db.scalar(
+                select(func.count())
+                .select_from(models.DistributionItem)
+                .join(
+                    models.Distribution,
+                    models.DistributionItem.distribution_id
+                    == models.Distribution.id,
+                )
+                .where(
+                    models.DistributionItem.authorization_id == aid,
+                    models.Distribution.status == "approved",
+                )
+            )
+            assert used == approved_items, (
+                f"授权 {aid} used_count={used} 与有效明细 {approved_items} 不符"
+            )
+    finally:
+        db.close()
+    assert tgt_now["used_count"] <= 8, "替代授权超额！"
+    print(
+        f"  PASS  迁移={'成功' if mig_code == 200 else '拒绝(余量不足)'}，"
+        f"新申请成功={new_ok}，tgt used={tgt_now['used_count']}/8（无超额、账实相符）"
+    )
+
+
+def scenario_migrate_vs_revoke() -> None:
+    print("== 场景6：迁移与并发撤销交错，不得重复释放 ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c6", "name": "迁移撤销竞态"}
+    ).json()["id"]
+    src = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "US",
+            "channel": "app",
+            "starts_at": (NOW - timedelta(days=1)).isoformat(),
+            "ends_at": (NOW + timedelta(days=1)).isoformat(),
+            "max_count": 10,
+        },
+    ).json()["id"]
+    tgt = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "US",
+            "channel": "app",
+            "starts_at": (NOW - timedelta(days=2)).isoformat(),
+            "ends_at": (NOW + timedelta(days=2)).isoformat(),
+            "max_count": 20,
+        },
+    ).json()["id"]
+
+    dist_ids = []
+    for _ in range(10):
+        r = client.post(
+            "/api/v1/distributions",
+            json={
+                "material_ids": [mid],
+                "region": "US",
+                "channel": "app",
+                "occur_at": NOW.isoformat(),
+            },
+        )
+        assert r.status_code == 201, r.text
+        dist_ids.append(r.json()["id"])
+
+    def migrate():
+        c = TestClient(app)
+        r = c.post(
+            f"/api/v1/authorizations/{src}/migrate",
+            json={"target_authorization_id": tgt},
+        )
+        return r.status_code, r.json()
+
+    def revoke(did: int):
+        c = TestClient(app)
+        return c.post(f"/api/v1/distributions/{did}/revoke").status_code
+
+    with ThreadPoolExecutor(max_workers=11) as pool:
+        mig_future = pool.submit(migrate)
+        revoke_futures = [pool.submit(revoke, did) for did in dist_ids]
+        mig_code, mig_body = mig_future.result()
+        revoke_codes = [f.result() for f in revoke_futures]
+
+    # 替代授权余量充足，迁移必成功；每条申请撤销恰一次。
+    assert mig_code == 200, mig_body
+    migrated = mig_body["migrated_count"]
+    assert 0 <= migrated <= 10, mig_body
+    assert revoke_codes.count(200) == 10, revoke_codes
+
+    # 全部申请最终均为 revoked；两端 used_count 都归零（无重复释放、
+    # 无遗漏释放），且等于各自 approved 明细数（0）。
+    src_now = client.get(f"/api/v1/authorizations/{src}").json()
+    tgt_now = client.get(f"/api/v1/authorizations/{tgt}").json()
+    assert src_now["used_count"] == 0, src_now
+    assert tgt_now["used_count"] == 0, tgt_now
+    assert src_now["status"] == "inactive", src_now
+    for did in dist_ids:
+        dist = client.get(f"/api/v1/distributions/{did}").json()
+        assert dist["status"] == "revoked", dist
+
+    db = SessionLocal()
+    try:
+        for aid in (src, tgt):
+            approved_items = db.scalar(
+                select(func.count())
+                .select_from(models.DistributionItem)
+                .join(
+                    models.Distribution,
+                    models.DistributionItem.distribution_id
+                    == models.Distribution.id,
+                )
+                .where(
+                    models.DistributionItem.authorization_id == aid,
+                    models.Distribution.status == "approved",
+                )
+            )
+            assert approved_items == 0, f"授权 {aid} 仍有 {approved_items} 条占用"
+    finally:
+        db.close()
+    print(
+        f"  PASS  迁移={migrated} 条，撤销成功=10，"
+        f"两端 used_count=0（无重复释放、账实相符）"
+    )
+
+
+def scenario_double_migrate() -> None:
+    print("== 场景7：同一源授权并发迁移两次，全部申请恰被改挂一次 ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c7", "name": "双重迁移"}
+    ).json()["id"]
+    src = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "KR",
+            "channel": "web",
+            "starts_at": (NOW - timedelta(days=1)).isoformat(),
+            "ends_at": (NOW + timedelta(days=1)).isoformat(),
+            "max_count": 5,
+        },
+    ).json()["id"]
+    tgt = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "KR",
+            "channel": "web",
+            "starts_at": (NOW - timedelta(days=2)).isoformat(),
+            "ends_at": (NOW + timedelta(days=2)).isoformat(),
+            "max_count": 10,
+        },
+    ).json()["id"]
+    for _ in range(3):
+        r = client.post(
+            "/api/v1/distributions",
+            json={
+                "material_ids": [mid],
+                "region": "KR",
+                "channel": "web",
+                "occur_at": NOW.isoformat(),
+            },
+        )
+        assert r.status_code == 201, r.text
+
+    def migrate():
+        c = TestClient(app)
+        r = c.post(
+            f"/api/v1/authorizations/{src}/migrate",
+            json={"target_authorization_id": tgt},
+        )
+        return r.status_code, r.json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: migrate(), range(2)))
+
+    codes = sorted(code for code, _ in results)
+    assert codes == [200, 200], f"两次迁移均应成功，实际 {codes}"
+    migrated_total = sum(body["migrated_count"] for _, body in results)
+    assert migrated_total == 3, f"迁移总数应为 3，实际 {migrated_total}"
+    src_now = client.get(f"/api/v1/authorizations/{src}").json()
+    tgt_now = client.get(f"/api/v1/authorizations/{tgt}").json()
+    assert src_now["status"] == "inactive" and src_now["used_count"] == 0
+    assert tgt_now["used_count"] == 3, tgt_now
+    print(
+        f"  PASS  两次迁移均 200，迁移数合计={migrated_total}，"
+        f"tgt used=3（无重复改挂）"
+    )
+
+
 def main() -> int:
     Base.metadata.drop_all(bind=engine)
     init_db()
@@ -278,6 +565,9 @@ def main() -> int:
         scenario_multi_material()
         scenario_revoke_race()
         scenario_repeat_revoke_race()
+        scenario_migrate_vs_apply()
+        scenario_migrate_vs_revoke()
+        scenario_double_migrate()
     print("\n全部并发场景通过：未发生超额、账实相符。")
     return 0
 
